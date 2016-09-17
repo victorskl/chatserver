@@ -4,13 +4,17 @@ import com.opencsv.CSVReader;
 import com.opencsv.bean.ColumnPositionMappingStrategy;
 import com.opencsv.bean.CsvToBean;
 import com.sankholin.comp90015.assignment1.chat.server.model.LocalChatRoomInfo;
+import com.sankholin.comp90015.assignment1.chat.server.model.Protocol;
+import com.sankholin.comp90015.assignment1.chat.server.model.RemoteChatRoomInfo;
 import com.sankholin.comp90015.assignment1.chat.server.model.ServerInfo;
-import com.sankholin.comp90015.assignment1.chat.server.service.ClientConnection;
-import com.sankholin.comp90015.assignment1.chat.server.service.PeerServerConnection;
-import com.sankholin.comp90015.assignment1.chat.server.service.ServerState;
-import com.sankholin.comp90015.assignment1.chat.server.service.ShutdownService;
+import com.sankholin.comp90015.assignment1.chat.server.service.*;
+import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.config.Configuration;
+import org.apache.logging.log4j.core.config.LoggerConfig;
+import org.json.simple.JSONObject;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.Option;
@@ -18,8 +22,8 @@ import org.kohsuke.args4j.Option;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ChatServer {
 
@@ -29,8 +33,12 @@ public class ChatServer {
     @Option(name = "-l", usage = "l=Server Configuration File")
     private String serverConfig = "./server.tab";
 
+    @Option(name = "-d", usage = "d=Debug")
+    private boolean debug = false;
+
     private ServerState serverState = ServerState.getInstance();
     private ServerInfo serverInfo;
+    private ExecutorService servicePool;
 
     public ChatServer(String[] args) {
         try {
@@ -40,24 +48,72 @@ public class ChatServer {
 
             logger.info("option: -s " + serverId);
             logger.info("option: -l " + serverConfig);
+            logger.info("option: -d " + debug);
 
-            logger.info("Reading server config...");
+            logger.info("Reading server config");
             readServerConfiguration();
 
-            logger.info("Init server state...");
+            logger.info("Init server state");
             serverState.initServerState(serverId);
 
             serverInfo = serverState.getServerInfo();
 
+            updateLogger();
+
             // POST
-
-            Runtime.getRuntime().addShutdownHook(new ShutdownService(Thread.currentThread()));
-
             setupMainHall();
             startUpConnections();
+            publishMainHall();
+
+            // Shutdown hook
+            Runtime.getRuntime().addShutdownHook(new ShutdownService(servicePool));
 
         } catch (CmdLineException e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
+        }
+    }
+
+    private void publishMainHall() {
+        String roomId = "MainHall-" + serverInfo.getServerId();
+        PeerClient peerClient = new PeerClient();
+        for (ServerInfo server : serverState.getServerInfoList()) {
+            if (server.equals(serverInfo)) continue;
+
+            if (serverState.isOnline(server)) {
+                // promote my main hall
+                JSONObject jj = new JSONObject();
+                //lockRoom()
+                jj.put(Protocol.type.toString(), Protocol.lockroomid.toString());
+                jj.put(Protocol.serverid.toString(), serverInfo.getServerId());
+                jj.put(Protocol.roomid.toString(), roomId);
+                peerClient.commPeer(server, jj.toJSONString());
+                jj.clear();
+                //releaseRoom()
+                jj.put(Protocol.type.toString(), Protocol.releaseroomid.toString());
+                jj.put(Protocol.serverid.toString(), serverInfo.getServerId());
+                jj.put(Protocol.roomid.toString(), roomId);
+                jj.put(Protocol.approved.toString(), "true");
+                peerClient.commPeer(server, jj.toJSONString());
+
+                // accept theirs
+                String key = "MainHall-" + server.getServerId();
+                if (serverState.isRoomExistedRemotely(key)) continue;
+                RemoteChatRoomInfo remoteChatRoomInfo = new RemoteChatRoomInfo();
+                remoteChatRoomInfo.setChatRoomId(key);
+                remoteChatRoomInfo.setManagingServer(server.getServerId());
+                serverState.getRemoteChatRooms().put(key, remoteChatRoomInfo);
+            }
+        }
+    }
+
+    private void updateLogger() {
+        if (debug) {
+            LoggerContext ctx = (LoggerContext) LogManager.getContext(false);
+            Configuration config = ctx.getConfiguration();
+            LoggerConfig loggerConfig = config.getLoggerConfig("com.sankholin");
+            loggerConfig.setLevel(Level.DEBUG);
+            ctx.updateLoggers();
+            logger.debug("Server is running in DEBUG mode");
         }
     }
 
@@ -68,7 +124,7 @@ public class ChatServer {
         try {
             serverState.setServerInfoList(csvToBean.parse(strategy, new CSVReader(new FileReader(serverConfig), '\t')));
         } catch (FileNotFoundException e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
         }
     }
 
@@ -80,89 +136,17 @@ public class ChatServer {
     }
 
     private void startUpConnections() {
-
-        new Thread(
-                () -> {
-                    ServerSocket clientServingSocket = null;
-                    try {
-                        clientServingSocket = new ServerSocket(serverInfo.getPort());
-                        logger.info("Server listening client on port "+ serverInfo.getPort() +" for a connection...");
-
-                        //int clientNum = 0;
-
-                        while (!serverState.isStopRunning()) {
-                            //clientNum++;
-
-                            //Create one thread per connection, each thread will be
-                            //responsible for listening for messages from the client, placing them
-                            //in a queue, and creating another thread that processes the messages
-                            //placed in the queue
-                            Socket clientSocket = clientServingSocket.accept();
-                            ClientConnection clientConnection = new ClientConnection(clientSocket);
-                            //clientConnection.setName("Thread" + clientNum);
-                            //clientConnection.start();
-                            new Thread(clientConnection).start();
-
-                            //Register the new connection with the client manager
-                            //ServerState.getInstance().clientConnected(clientConnection);
-                        }
-
-                        logger.info("Closing client socket: " + clientServingSocket.getLocalPort());
-                        clientServingSocket.close();
-                        logger.info("DONE!");
-
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    } finally {
-                        if (clientServingSocket != null) {
-                            try {
-                                clientServingSocket.close();
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                            }
-                        }
-                    }
-                }
-        ).start();
-
-        new Thread(
-                ()-> {
-                    ServerSocket managementSocket = null;
-                    try {
-                        managementSocket = new ServerSocket(serverInfo.getManagementPort());
-                        logger.info("Server listening peer on management port "+ serverInfo.getManagementPort() +" for a connection...");
-
-                        //int clientNum = 0;
-
-                        while (!serverState.isStopRunning()) {
-                            //clientNum++;
-
-                            Socket managementClientSocket = managementSocket.accept();
-                            PeerServerConnection peerServerConnection = new PeerServerConnection(managementClientSocket);
-                            new Thread(peerServerConnection).start();
-
-                            //Register the new connection with the client manager
-                            //ServerState.getInstance().clientConnected(clientConnection);
-                        }
-
-                        logger.info("Closing management socket: " + managementSocket.getLocalPort());
-                        managementSocket.close();
-                        logger.info("DONE!");
-
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    } finally {
-                        if (managementSocket != null) {
-                            try {
-                                managementSocket.close();
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                            }
-                        }
-                    }
-                }
-        ).start();
+        servicePool = Executors.newFixedThreadPool(SERVER_SOCKET_POOL);
+        try {
+            servicePool.execute(new ClientService(serverInfo.getPort(), CLIENT_SOCKET_POOL));
+            servicePool.execute(new ManagementService(serverInfo.getManagementPort(), serverState.getServerInfoList().size()));
+        } catch (IOException e) {
+            logger.trace(e.getMessage());
+            servicePool.shutdown();
+        }
     }
 
+    private static final int SERVER_SOCKET_POOL = 2;
+    private static final int CLIENT_SOCKET_POOL = 100;
     private static final Logger logger = LogManager.getLogger(ChatServer.class);
 }

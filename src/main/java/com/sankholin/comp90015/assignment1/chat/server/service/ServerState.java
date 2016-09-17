@@ -6,11 +6,15 @@ import com.sankholin.comp90015.assignment1.chat.server.model.ServerInfo;
 import com.sankholin.comp90015.assignment1.chat.server.model.UserInfo;
 import org.apache.commons.lang3.StringUtils;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ServerState {
@@ -88,8 +92,16 @@ public class ServerState {
         return connectedClients.containsKey(userId);
     }
 
-    public boolean isRoomExisted(String roomId) {
+    public boolean isRoomExistedGlobally(String roomId) {
         return localChatRooms.containsKey(roomId) || remoteChatRooms.containsKey(roomId);
+    }
+
+    public boolean isRoomExistedLocally(String roomId) {
+        return localChatRooms.containsKey(roomId);
+    }
+
+    public boolean isRoomExistedRemotely(String roomId) {
+        return remoteChatRooms.containsKey(roomId);
     }
 
     public void stopRunning(boolean state) {
@@ -128,8 +140,8 @@ public class ServerState {
 
     // Utilities
 
-    public static int MIN_CHAR = 3;
-    public static int MAX_CHAR = 16;
+    public static int MIN_CHAR = 2;
+    public static int MAX_CHAR = 17;
 
     public boolean isIdValid(String id) {
         // The identity must be
@@ -137,5 +149,20 @@ public class ServerState {
         // It must be at least 3 characters and no more than 16 characters long
         int length = id.length();
         return (StringUtils.isAlphanumeric(id) && length > MIN_CHAR && length < MAX_CHAR);
+    }
+
+    public boolean isOnline(ServerInfo serverInfo) {
+        boolean online = true;
+        try {
+            InetSocketAddress address = new InetSocketAddress(serverInfo.getAddress(), serverInfo.getManagementPort());
+            final int timeOut = (int) TimeUnit.SECONDS.toMillis(5);
+            final Socket shortKet = new Socket();
+            shortKet.connect(address, timeOut);
+            shortKet.close();
+        } catch (IOException e) {
+            //e.printStackTrace();
+            online = false;
+        }
+        return online;
     }
 }

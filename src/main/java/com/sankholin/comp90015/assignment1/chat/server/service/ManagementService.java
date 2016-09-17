@@ -12,6 +12,7 @@ public class ManagementService implements Runnable {
 
     private final ServerSocket serverSocket;
     private final ExecutorService pool;
+    private ServerState serverState = ServerState.getInstance();
 
     public ManagementService(int port, int poolSize) throws IOException {
         serverSocket = new ServerSocket(port);
@@ -24,11 +25,15 @@ public class ManagementService implements Runnable {
 
             logger.info("Server listening peer on management port "+ serverSocket.getLocalPort() +" for a connection...");
 
-            for (;;) {
-                pool.execute(new ClientConnection(serverSocket.accept()));
+            while (!serverState.isStopRunning()) {
+                pool.execute(new ManagementConnectionHandler(serverSocket.accept()));
             }
+
+            pool.shutdown();
         } catch (IOException ex) {
             pool.shutdown();
+        } finally {
+            pool.shutdownNow();
         }
     }
 

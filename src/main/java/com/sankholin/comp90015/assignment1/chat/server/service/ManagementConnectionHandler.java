@@ -13,55 +13,54 @@ import java.io.*;
 import java.net.Socket;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 
-public class PeerServerConnection implements Runnable {
+public class ManagementConnectionHandler implements Runnable {
+
+    private ServerState serverState = ServerState.getInstance();
 
     private Socket clientSocket;
     private BufferedReader reader;
     private BufferedWriter writer;
     private BlockingQueue<Message> messageQueue;
     private JSONParser parser;
+    private ExecutorService pool;
 
-    private ServerState serverState = ServerState.getInstance();
-
-    public PeerServerConnection(Socket clientSocket) {
+    public ManagementConnectionHandler(Socket clientSocket) {
         try {
             this.clientSocket = clientSocket;
             this.reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), "UTF-8"));;
             this.writer = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream(), "UTF-8"));
             this.messageQueue = new LinkedBlockingQueue<>();
             this.parser = new JSONParser();
+            this.pool = Executors.newSingleThreadExecutor();
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
         }
-        logger.info("Peer connection is up...");
     }
 
     @Override
     public void run() {
         try {
 
-            ClientMessageReader messageReader = new ClientMessageReader(reader, messageQueue);
-            //messageReader.setName(this.getName() + "Reader");
-            messageReader.start();
-            System.out.println(Thread.currentThread().getName() + " - Processing peer messages");
+            pool.execute(new MessageReader(reader, messageQueue));
 
             while (true) {
 
                 Message msg = messageQueue.take();
 
                 if (!msg.isFromClient() && msg.getMessage().equals("exit")) {
-                    //The client program is abruptly terminated (e.g. using Ctrl-C)
-                    //{"type" : "roomchange", "identity" : "Adel", "former" : "MainHall-s1", "roomid" : ""}
-                    //broadcastMessageToRoom(roomChange(currentChatRoom, ""), currentChatRoom);
-                    //write(roomChange(currentChatRoom, "")); cant do it, too late. socket has already gone!
+                    logger.trace("EOF");
                     break;
                 }
 
                 if (msg.isFromClient()) {
 
                     JSONObject jsonMessage = (JSONObject) parser.parse(msg.getMessage());
+                    logger.debug("[S2S]Receiving: " + msg.getMessage());
+
                     String type = (String) jsonMessage.get(Protocol.type.toString());
 
                     // acquire lock for user id
@@ -69,23 +68,27 @@ public class PeerServerConnection implements Runnable {
                         // {"type" : "lockidentity", "serverid" : "s1", "identity" : "Adel"}
                         String requestUserId = (String) jsonMessage.get(Protocol.identity.toString());
                         String serverId = (String) jsonMessage.get(Protocol.serverid.toString());
+                        String lok = serverId.concat(requestUserId);
 
                         boolean isUserExisted = serverState.isUserExisted(requestUserId);
-                        boolean isUserLocked = serverState.isIdentityLocked(requestUserId);
+                        boolean isUserLocked = serverState.isIdentityLocked(lok);
 
                         if (isUserExisted || isUserLocked) {
                             messageQueue.add(new Message(false, lockIdentity(serverId, requestUserId, "false")));
                         } else {
-                            serverState.lockIdentity(requestUserId);
+                            serverState.lockIdentity(lok);
                             messageQueue.add(new Message(false, lockIdentity(serverId, requestUserId, "true")));
                         }
                     }
 
-                    // release lock
+                    // release lock for user id
                     if (type.equalsIgnoreCase(Protocol.releaseidentity.toString())) {
                         // {"type" : "releaseidentity", "serverid" : "s1", "identity" : "Adel"}
                         String requestUserId = (String) jsonMessage.get(Protocol.identity.toString());
-                        serverState.unlockIdentity(requestUserId); //TODO spec say check serverId, but it is not required, ambiguous??
+                        String serverId = (String) jsonMessage.get(Protocol.serverid.toString());
+                        String lok = serverId.concat(requestUserId);
+                        serverState.unlockIdentity(lok);
+                        messageQueue.add(new Message(false, "exit"));
                     }
 
                     // acquire vote for locking room id
@@ -105,7 +108,7 @@ public class PeerServerConnection implements Runnable {
                         }
                     }
 
-                    // release room
+                    // release lock for room id
                     if (type.equalsIgnoreCase(Protocol.releaseroomid.toString())) {
                         // "type" : "releaseroomid", "serverid" : "s1", "roomid" : "jokes", "approved":"true"}
                         String requestRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
@@ -117,32 +120,38 @@ public class PeerServerConnection implements Runnable {
                             // then release the lock and
                             // record it as a new chat room with id "jokes" that was created in server s1.
                             serverState.unlockRoomIdentity(requestRoomId);
+
                             RemoteChatRoomInfo remoteChatRoomInfo = new RemoteChatRoomInfo();
                             remoteChatRoomInfo.setChatRoomId(requestRoomId);
                             remoteChatRoomInfo.setManagingServer(serverId);
                             serverState.getRemoteChatRooms().put(requestRoomId, remoteChatRoomInfo);
+                        } else {
+                            // do nothing
                         }
+
+                        messageQueue.add(new Message(false, "exit"));
                     }
 
-                    // delete room // TODO not stated in spec
+                    // delete room
                     if (type.equalsIgnoreCase(Protocol.deleteroom.toString())) {
                         //{"type" : "deleteroom", "serverid" : "s1", "roomid" : "jokes"}
                         String deletingRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
                         serverState.getRemoteChatRooms().remove(deletingRoomId);
+                        messageQueue.add(new Message(false, "exit"));
                     }
 
-
                 } else {
+                    logger.debug("[S2S]Sending  : " + msg.getMessage());
                     write(msg.getMessage());
                 }
             }
 
-            //serverState.getConnectedClients().remove(this.identity);
-            this.clientSocket.close();
-            //System.out.println(Thread.currentThread().getName() + " - Client " + clientNum + " disconnected");
+            pool.shutdown();
+            clientSocket.close();
 
         } catch (InterruptedException | IOException | ParseException e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
+            pool.shutdownNow();
         }
     }
 
@@ -170,11 +179,10 @@ public class PeerServerConnection implements Runnable {
         try {
             writer.write(msg + "\n");
             writer.flush();
-            //System.out.println(Thread.currentThread().getName() + " - Message sent to client " + clientNum);
         } catch (IOException e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
         }
     }
 
-    private static final Logger logger = LogManager.getLogger(PeerServerConnection.class);
+    private static final Logger logger = LogManager.getLogger(ManagementConnectionHandler.class);
 }

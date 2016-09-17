@@ -6,46 +6,48 @@ import org.apache.logging.log4j.Logger;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
-import org.json.simple.parser.ParseException;
 
 import java.io.*;
 import java.net.Socket;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.stream.Collectors;
 
-public class ClientConnection implements Runnable {
+public class ClientConnectionHandler implements Runnable {
+
+    private ServerState serverState = ServerState.getInstance();
 
     private Socket clientSocket;
     private BufferedReader reader;
     private BufferedWriter writer;
     private BlockingQueue<Message> messageQueue;
-    //private int clientNum;
     private JSONParser parser;
-
-    private ServerState serverState = ServerState.getInstance();
+    private ExecutorService pool;
+    private PeerClient peerClient;
 
     private ServerInfo serverInfo;
     private String mainHall;
-
+    private boolean routed = false;
     private UserInfo userInfo;
 
-    public ClientConnection(Socket clientSocket) {
+    public ClientConnectionHandler(Socket clientSocket) {
         try {
             this.clientSocket = clientSocket;
             this.reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), "UTF-8"));
             this.writer = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream(), "UTF-8"));
             this.messageQueue = new LinkedBlockingQueue<>();
-            //this.clientNum = clientNum;
             this.parser = new JSONParser();
+            this.pool = Executors.newSingleThreadExecutor();
+            this.peerClient = new PeerClient();
 
             this.serverInfo = serverState.getServerInfo();
-            this.mainHall =  "MainHall-" + serverInfo.getServerId();
+            this.mainHall = "MainHall-" + serverInfo.getServerId();
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
         }
-        logger.info("Client connection is up...");
     }
 
     @Override
@@ -53,32 +55,36 @@ public class ClientConnection implements Runnable {
 
         try {
 
-            ClientMessageReader messageReader = new ClientMessageReader(reader, messageQueue);
-            //messageReader.setName(this.getName() + "Reader");
-            messageReader.start();
-            System.out.println(Thread.currentThread().getName() + " - Processing client messages");
+            pool.execute(new MessageReader(reader, messageQueue));
+
+            logger.trace("Processing client messages");
 
             while (true) {
 
                 Message msg = messageQueue.take();
 
-                if (!msg.isFromClient() && msg.getMessage().equals("exit")) {
+                if (!msg.isFromClient() && msg.getMessage().equalsIgnoreCase("exit")) {
                     //The client program is abruptly terminated (e.g. using Ctrl-C)
-                    //broadcastMessageToRoom(roomChange(userInfo.getCurrentChatRoom(), ""), userInfo.getCurrentChatRoom());
-                    //write(roomChange(currentChatRoom, "")); cant do it, too late. socket has already gone!
-                    performPreExit();
+                    if (userInfo != null) {
+                        doGracefulQuit();
+                        if (!routed) {
+                            String former = userInfo.getCurrentChatRoom();
+                            broadcastMessageToRoom(roomChange(former, ""), former, userInfo.getIdentity());
+                        }
+                    }
+                    logger.trace("EOF");
                     break;
                 }
 
                 if (msg.isFromClient()) {
 
                     JSONObject jsonMessage = (JSONObject) parser.parse(msg.getMessage());
+                    logger.debug("Receiving: " + msg.getMessage());
+
                     String type = (String) jsonMessage.get(Protocol.type.toString());
 
                     if (type.equalsIgnoreCase(Protocol.newidentity.toString())) {
                         String requestIdentity = (String) jsonMessage.get(Protocol.identity.toString());
-
-                        //serverState.lockIdentity(identity); // TODO not stated in spec
 
                         boolean isUserExisted = serverState.isUserExisted(requestIdentity);
                         boolean isUserIdValid = serverState.isIdValid(requestIdentity);
@@ -88,7 +94,7 @@ public class ClientConnection implements Runnable {
                             messageQueue.add(new Message(false, newIdentityResp("false")));
                         } else {
 
-                            boolean canLock = canPeersLockId(lockIdentity(requestIdentity));
+                            boolean canLock = peerClient.canPeersLockId(lockIdentity(requestIdentity));
 
                             if (canLock) {
                                 userInfo = new UserInfo();
@@ -100,47 +106,46 @@ public class ClientConnection implements Runnable {
                                 serverState.getConnectedClients().put(requestIdentity, userInfo);
                                 serverState.getLocalChatRooms().get(mainHall).addMember(requestIdentity);
 
+                                logger.info("Client connected: " + requestIdentity);
+
                                 //{"type" : "newidentity", "approved" : "true"}
                                 messageQueue.add(new Message(false, newIdentityResp("true")));
 
                                 //{"type" : "roomchange", "identity" : "Adel", "former" : "", "roomid" : "MainHall-s1"}
                                 broadcastMessageToRoom(roomChange("", mainHall), mainHall);
+                            } else {
+                                messageQueue.add(new Message(false, newIdentityResp("false")));
                             }
 
                             // release identity on peers
-                            relayPeers(releaseIdentity(requestIdentity));
+                            peerClient.relayPeers(releaseIdentity(requestIdentity));
                         }
-
-                        //serverState.unlockIdentity(identity); // TODO not stated in spec
                     }
 
                     if (type.equalsIgnoreCase(Protocol.list.toString())) {
-                        //write(listRooms());
                         messageQueue.add(new Message(false, listRooms()));
                     }
 
                     if (type.equalsIgnoreCase(Protocol.who.toString())) {
-                        //write(whoByRoom(currentChatRoom));
                         messageQueue.add(new Message(false, whoByRoom(userInfo.getCurrentChatRoom())));
                     }
 
                     if (type.equalsIgnoreCase(Protocol.createroom.toString())) {
                         String requestRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
 
-                        boolean isRoomExisted = serverState.isRoomExisted(requestRoomId);
+                        boolean isRoomExisted = serverState.isRoomExistedGlobally(requestRoomId);
                         boolean hasRoomAlreadyLocked = serverState.isRoomIdLocked(requestRoomId);
+                        boolean isRoomIdValid = serverState.isIdValid(requestRoomId);
 
                         // if and only if the client is not the owner of another chat room
-                        if (userInfo.isRoomOwner() || hasRoomAlreadyLocked || isRoomExisted) {
+                        if (userInfo.isRoomOwner() || hasRoomAlreadyLocked || isRoomExisted || !isRoomIdValid) {
                             write(createRoomResp(requestRoomId, "false"));
                         } else {
 
-                            //serverState.lockRoomIdentity(requestRoomId); // TODO not stated in spec
-
-                            boolean canLock = canPeersLockId(lockRoom(requestRoomId));
+                            boolean canLock = peerClient.canPeersLockId(lockRoom(requestRoomId));
                             if (canLock) {
                                 // release lock
-                                relayPeers(releaseRoom(requestRoomId, "true"));
+                                peerClient.relayPeers(releaseRoom(requestRoomId, "true"));
 
                                 // create and update room
                                 LocalChatRoomInfo newRoom = new LocalChatRoomInfo();
@@ -159,49 +164,58 @@ public class ClientConnection implements Runnable {
 
                                 // response client
                                 write(createRoomResp(requestRoomId, "true"));
+                                write(roomChange(former, userInfo.getCurrentChatRoom()));
                                 broadcastMessageToRoom(roomChange(former, userInfo.getCurrentChatRoom()), former);
 
                             } else {
-                                relayPeers(releaseRoom(requestRoomId, "false"));
+                                peerClient.relayPeers(releaseRoom(requestRoomId, "false"));
                                 write(createRoomResp(requestRoomId, "false"));
                             }
-
-                            //serverState.unlockRoomIdentity(requestRoomId); // TODO not stated in spec
                         }
                     }
 
                     if (type.equalsIgnoreCase(Protocol.join.toString())) {
                         // {"type" : "join", "roomid" : "jokes"}
                         String joiningRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
-                        boolean isRoomExisted = serverState.isRoomExisted(joiningRoomId);
-                        if (userInfo.isRoomOwner() || !isRoomExisted) {
+                        boolean roomExistedGlobally = serverState.isRoomExistedGlobally(joiningRoomId);
+                        boolean isTheSameRoom = userInfo.getCurrentChatRoom().equalsIgnoreCase(joiningRoomId);
+                        if (userInfo.isRoomOwner() || !roomExistedGlobally || isTheSameRoom) {
                             messageQueue.add(new Message(false, roomChange(joiningRoomId, joiningRoomId)));
-                        }
+                        } else {
 
-                        String former = userInfo.getCurrentChatRoom();
+                            boolean roomExistedLocally = serverState.isRoomExistedLocally(joiningRoomId);
+                            boolean roomExistedRemotely = serverState.isRoomExistedRemotely(joiningRoomId);
 
-                        // if room is in the same server
-                        if (serverState.getLocalChatRooms().containsKey(joiningRoomId)) {
-                            userInfo.setCurrentChatRoom(joiningRoomId);
+                            String former = userInfo.getCurrentChatRoom();
 
+                            // If room is in the same server
+                            if (roomExistedLocally) {
+                                userInfo.setCurrentChatRoom(joiningRoomId);
+
+                                serverState.getLocalChatRooms().get(joiningRoomId).addMember(userInfo.getIdentity());
+
+                                broadcastMessageToRoom(roomChange(former, joiningRoomId), former, userInfo.getIdentity());
+                                broadcastMessageToRoom(roomChange(former, joiningRoomId), joiningRoomId, userInfo.getIdentity());
+                                messageQueue.add(new Message(false, roomChange(former, joiningRoomId)));
+                            }
+
+                            // If the chat room is managed by a different server
+                            if (roomExistedRemotely) {
+                                RemoteChatRoomInfo remoteChatRoomInfo = serverState.getRemoteChatRooms().get(joiningRoomId);
+                                ServerInfo server = serverState.getServerInfoById(remoteChatRoomInfo.getManagingServer());
+
+                                messageQueue.add(new Message(false, route(joiningRoomId, server.getAddress(), server.getPort())));
+
+                                //serverState.getConnectedClients().remove(userInfo.getIdentity());
+                                routed = true;
+
+                                broadcastMessageToRoom(roomChange(former, joiningRoomId), former);
+
+                                logger.info(userInfo.getIdentity() + " has routed to server " + server.getServerId());
+                            }
+
+                            // Either case, remove user from former room on this server memory
                             serverState.getLocalChatRooms().get(former).removeMember(userInfo.getIdentity());
-                            serverState.getLocalChatRooms().get(joiningRoomId).addMember(userInfo.getIdentity());
-
-                            broadcastMessageToRoom(roomChange(former, joiningRoomId), former);
-                            broadcastMessageToRoom(roomChange(former, joiningRoomId), joiningRoomId);
-                            messageQueue.add(new Message(false, roomChange(former, joiningRoomId)));
-                        }
-
-                        // If the chat room is managed by a different server
-                        if (serverState.getRemoteChatRooms().containsKey(joiningRoomId)) {
-                            RemoteChatRoomInfo remoteChatRoomInfo = serverState.getRemoteChatRooms().get(joiningRoomId);
-                            ServerInfo server = serverState.getServerInfoById(remoteChatRoomInfo.getManagingServer());
-
-                            messageQueue.add(new Message(false, route(joiningRoomId, server.getAddress(), server.getPort())));
-
-                            performPreExit();
-                            //serverState.getConnectedClients().remove(userInfo.getIdentity());
-                            broadcastMessageToRoom(roomChange(former, joiningRoomId), former);
                         }
                     }
 
@@ -210,44 +224,52 @@ public class ClientConnection implements Runnable {
                         String joiningRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
                         String former = (String) jsonMessage.get(Protocol.former.toString());
                         String identity = (String) jsonMessage.get(Protocol.identity.toString());
-                        boolean isRoomExisted = serverState.getLocalChatRooms().containsKey(joiningRoomId);
+                        boolean roomExistedLocally = serverState.isRoomExistedLocally(joiningRoomId);
 
-                        UserInfo migrant = new UserInfo();
-                        migrant.setIdentity(identity);
-                        migrant.setRoomOwner(false);
-                        migrant.setSocket(clientSocket);
-                        migrant.setManagingThread(this);
+                        userInfo = new UserInfo();
+                        userInfo.setIdentity(identity);
+                        userInfo.setManagingThread(this);
+                        userInfo.setSocket(clientSocket);
 
                         String roomId;
-                        if (isRoomExisted) {
+                        if (roomExistedLocally) {
                             roomId = joiningRoomId;
                         } else {
                             // room has gone, place in MainHall
                             roomId = mainHall;
                         }
-                        migrant.setCurrentChatRoom(roomId);
+                        userInfo.setCurrentChatRoom(roomId);
+                        serverState.getConnectedClients().put(identity, userInfo);
                         serverState.getLocalChatRooms().get(roomId).addMember(identity);
-                        serverState.getConnectedClients().put(identity, migrant);
 
-                        broadcastMessageToRoom(roomChange(former, joiningRoomId), joiningRoomId);
-                        messageQueue.add(new Message(false, serverChange("true", serverInfo.getServerId())));
+                        logger.info("Client connected: " + identity);
+
+                        write(serverChange("true", serverInfo.getServerId()));
+                        broadcastMessageToRoom(roomChange(former, roomId), roomId);
                     }
 
                     if (type.equalsIgnoreCase(Protocol.deleteroom.toString())) {
                         // {"type" : "deleteroom", "roomid" : "jokes"}
                         String deleteRoomId = (String) jsonMessage.get(Protocol.roomid.toString());
-                        boolean isRoomExisted = serverState.isRoomExisted(deleteRoomId);
-                        LocalChatRoomInfo deletingRoom = serverState.getLocalChatRooms().get(deleteRoomId);
-                        if (deletingRoom.getOwner().equalsIgnoreCase(userInfo.getIdentity()) && isRoomExisted) {
+                        boolean roomExistedLocally = serverState.isRoomExistedLocally(deleteRoomId);
+                        if (roomExistedLocally) {
+                            LocalChatRoomInfo deletingRoom = serverState.getLocalChatRooms().get(deleteRoomId);
+                            if (deletingRoom.getOwner().equalsIgnoreCase(userInfo.getIdentity())) {
 
-                            userInfo.setRoomOwner(false);
+                                userInfo.setRoomOwner(false);
+                                userInfo.setCurrentChatRoom(mainHall);
 
-                            doDeleteRoomProtocol(deletingRoom);
+                                doDeleteRoomProtocol(deletingRoom);
 
-                            messageQueue.add(new Message(false, deleteRoom(deleteRoomId, "true")));
+                                broadcastMessageToRoom(roomChange(deleteRoomId, mainHall), deleteRoomId);
+                                broadcastMessageToRoom(roomChange(deleteRoomId, mainHall), mainHall);
 
+                                write(deleteRoom(deleteRoomId, "true"));
+                                //messageQueue.add(new Message(false, deleteRoom(deleteRoomId, "true")));
+                            } else {
+                                messageQueue.add(new Message(false, deleteRoom(deleteRoomId, "false")));
+                            }
                         } else {
-
                             messageQueue.add(new Message(false, deleteRoom(deleteRoomId, "false")));
                         }
                     }
@@ -255,44 +277,60 @@ public class ClientConnection implements Runnable {
                     if (type.equalsIgnoreCase(Protocol.message.toString())) {
                         // {"type" : "message", "content" : "Hi there!"}
                         String content = (String) jsonMessage.get(Protocol.content.toString());
-                        broadcastMessageToRoom(message(content), userInfo.getCurrentChatRoom());
+                        broadcastMessageToRoom(message(content), userInfo.getCurrentChatRoom(), userInfo.getIdentity());
                     }
 
                     if (type.equalsIgnoreCase(Protocol.quit.toString())) {
                         //{"type" : "roomchange", "identity" : "Adel", "former" : "MainHall-s1", "roomid" : ""}
 
                         String former = userInfo.getCurrentChatRoom();
-                        LocalChatRoomInfo deletingRoom = serverState.getLocalChatRooms().get(former);
 
-                        // follow delete room protocol if owner
-                        if (userInfo.isRoomOwner()) {
-                            doDeleteRoomProtocol(deletingRoom);
-                        }
+                        doGracefulQuit();
 
                         // update about quitting user
-                        broadcastMessageToRoom(roomChange(former, ""), mainHall);
-                        messageQueue.add(new Message(false, roomChange(mainHall, "")));
-                        performPreExit();
+                        if (userInfo.isRoomOwner()) {
+                            broadcastMessageToRoom(roomChange(former, ""), mainHall, userInfo.getIdentity());
+                        } else {
+                            broadcastMessageToRoom(roomChange(former, ""), former, userInfo.getIdentity());
+                        }
+
+                        write(roomChange(former, ""));
+                        break;
                     }
 
                 } else {
-                    //If the message is from a thread and it isn't exit, then
-                    //it is a message that needs to be sent to the client
-                    write(msg.getMessage());  // write message from queue
+                    logger.debug("Sending  : " + msg.getMessage());
+                    write(msg.getMessage());
                 }
             }
 
+            pool.shutdown();
             clientSocket.close();
-            System.out.println(Thread.currentThread().getName() + " - Client disconnected");
+            if (userInfo != null) {
+                logger.info("Client disconnected: " + userInfo.getIdentity());
+            } else {
+                logger.info("Can not create UserInfo. Identity might already in use.");
+            }
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
+            pool.shutdownNow();
         }
     }
 
-    private void performPreExit() {
-        //serverState.getConnectedClients().remove(userInfo.getIdentity());
-        //serverState.getLocalChatRooms()
+    private void doGracefulQuit() {
+        String former = userInfo.getCurrentChatRoom();
+
+        // remove user from room
+        serverState.getLocalChatRooms().get(former).removeMember(userInfo.getIdentity());
+
+        // follow delete room protocol if owner
+        if (userInfo.isRoomOwner()) {
+            doDeleteRoomProtocol(serverState.getLocalChatRooms().get(former));
+        }
+
+        // remove user
+        serverState.getConnectedClients().remove(userInfo.getIdentity());
     }
 
     private String serverChange(String approved, String serverId) {
@@ -310,7 +348,7 @@ public class ClientConnection implements Runnable {
         jj.put(Protocol.type.toString(), Protocol.route.toString());
         jj.put(Protocol.roomid.toString(), joiningRoomId);
         jj.put(Protocol.host.toString(), host);
-        jj.put(Protocol.port.toString(), port);
+        jj.put(Protocol.port.toString(), port.toString());
         return jj.toJSONString();
     }
 
@@ -328,16 +366,20 @@ public class ClientConnection implements Runnable {
         serverState.getLocalChatRooms().get(mainHall).getMembers().addAll(deletingRoom.getMembers());
         for (String member : deletingRoom.getMembers()) {
             UserInfo client = serverState.getConnectedClients().get(member);
+            if (client.getIdentity().equalsIgnoreCase(userInfo.getIdentity())) continue;
+
+            // TODO option#1 - work from this thread, option#2 - work on each connected client thread
             client.setCurrentChatRoom(mainHall);
+            String msg = roomChange(deletingRoom.getChatRoomId(), mainHall, client.getIdentity());
+            broadcastMessageToRoom(msg, deletingRoom.getChatRoomId());
+            broadcastMessageToRoom(msg, mainHall);
         }
 
         // delete the room
         serverState.getLocalChatRooms().remove(deletingRoom.getChatRoomId());
 
         // inform peers
-        relayPeers(deleteRoomPeers(deletingRoom.getChatRoomId()));
-
-        broadcastMessageToRoom(roomChange(deletingRoom.getChatRoomId(), mainHall), mainHall);
+        peerClient.relayPeers(deleteRoomPeers(deletingRoom.getChatRoomId()));
     }
 
     private String deleteRoom(String roomId, String approved) {
@@ -443,26 +485,42 @@ public class ClientConnection implements Runnable {
     }
 
     private String roomChange(String former, String roomId) {
+        return roomChange(former, roomId, userInfo.getIdentity());
+    }
+
+    private String roomChange(String former, String roomId, String identity) {
         // {"type" : "roomchange", "identity" : "Maria", "former" : "jokes", "roomid" : "jokes"}
         JSONObject jj = new JSONObject();
         jj.put(Protocol.type.toString(), Protocol.roomchange.toString());
-        jj.put(Protocol.identity.toString(), userInfo.getIdentity());
+        jj.put(Protocol.identity.toString(), identity);
         jj.put(Protocol.former.toString(), former);
         jj.put(Protocol.roomid.toString(), roomId);
         return jj.toJSONString();
     }
 
     private void broadcastMessageToRoom(String message, String room) {
-        Message msgForThreads = new Message(false, message);
+        Message msg = new Message(false, message);
 
         Map<String, UserInfo> connectedClients = serverState.getConnectedClients();
-        //Place the message on the client's queue
+
         connectedClients.values().stream()
                 .filter(client -> client.getCurrentChatRoom().equalsIgnoreCase(room))
                 .forEach(client -> {
-            //Place the message on the client's queue
-            client.getManagingThread().getMessageQueue().add(msgForThreads);
+            client.getManagingThread().getMessageQueue().add(msg);
         });
+    }
+
+    private void broadcastMessageToRoom(String message, String room, String exceptUserId) {
+        Message msg = new Message(false, message);
+
+        Map<String, UserInfo> connectedClients = serverState.getConnectedClients();
+
+        connectedClients.values().stream()
+                .filter(client -> client.getCurrentChatRoom().equalsIgnoreCase(room))
+                .filter(client -> !client.getIdentity().equalsIgnoreCase(exceptUserId))
+                .forEach(client -> {
+                    client.getManagingThread().getMessageQueue().add(msg);
+                });
     }
 
     public BlockingQueue<Message> getMessageQueue() {
@@ -473,81 +531,13 @@ public class ClientConnection implements Runnable {
         try {
             writer.write(msg + "\n");
             writer.flush();
-            System.out.println(Thread.currentThread().getName() + " - Message sent to client ");
+
+            logger.trace("Message flush");
+
         } catch (IOException e) {
-            e.printStackTrace();
+            logger.trace(e.getMessage());
         }
     }
 
-    //public String getCurrentChatRoom() {
-    //    return currentChatRoom;
-    //}
-
-    //////
-
-    private String commPeers(ServerInfo server, String message) {
-
-        Socket socket = null;
-        try {
-            socket = new Socket(server.getAddress(), server.getManagementPort());
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
-            writer.write(message + "\n");
-            writer.flush();
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
-            return reader.readLine();
-
-        } catch (IOException ioe) {
-            System.out.println(server.getServerId() + " is not online...");
-            //ioe.printStackTrace();
-        } finally {
-            if (socket != null) {
-                try {
-                    socket.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private boolean canPeersLockId(String jsonMessage) {
-        boolean canLock = true;
-
-        for (ServerInfo server : serverState.getServerInfoList()) {
-            if (!server.getServerId().equalsIgnoreCase(this.serverInfo.getServerId())) {
-
-                String resp = commPeers(server, jsonMessage);
-
-                if (resp == null) continue;
-
-                JSONObject jj = null;
-                try {
-                    jj = (JSONObject) parser.parse(resp);
-                } catch (ParseException e) {
-                    e.printStackTrace();
-                }
-
-                String status = (String) jj.get(Protocol.locked.toString());
-                if (status.equalsIgnoreCase("false")) {
-                    canLock = false; // denied lock
-                }
-
-            }
-        }
-
-        return canLock;
-    }
-
-    private void relayPeers(String jsonMessage) {
-        serverState.getServerInfoList().stream()
-                .filter(server -> !server.getServerId().equalsIgnoreCase(this.serverInfo.getServerId()))
-                .forEach(server -> {
-                    commPeers(server, jsonMessage);
-        });
-    }
-
-    private static final Logger logger = LogManager.getLogger(ClientConnection.class);
+    private static final Logger logger = LogManager.getLogger(ClientConnectionHandler.class);
 }

@@ -4,11 +4,11 @@
     <Appenders>
 
         <Console name="Console" target="SYSTEM_OUT">
-            <PatternLayout pattern="%d{DEFAULT} [%t] %-5level %logger{36} - %msg%n"/>
+            <PatternLayout pattern="%d{DEFAULT} [%t] %-5level %logger{1} - %msg%n"/>
         </Console>
 
         <File name="File" fileName="app.log" append="false">
-            <PatternLayout pattern="%d{DEFAULT} [%t] %-5level %logger{36} - %msg%n"/>
+            <PatternLayout pattern="%d{DEFAULT} [%t] %-5level %logger{1} - %msg%n"/>
         </File>
 
     </Appenders>

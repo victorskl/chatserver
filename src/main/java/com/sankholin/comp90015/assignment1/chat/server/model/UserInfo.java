@@ -1,6 +1,6 @@
 package com.sankholin.comp90015.assignment1.chat.server.model;
 
-import com.sankholin.comp90015.assignment1.chat.server.service.ClientConnection;
+import com.sankholin.comp90015.assignment1.chat.server.service.ClientConnectionHandler;
 
 import java.net.Socket;
 
@@ -8,7 +8,7 @@ public class UserInfo {
     private String identity;
     private String currentChatRoom;
     private Socket socket;
-    private ClientConnection managingThread;
+    private ClientConnectionHandler managingThread;
     private boolean roomOwner = false;
 
     public String getIdentity() {
@@ -35,11 +35,11 @@ public class UserInfo {
         this.socket = socket;
     }
 
-    public ClientConnection getManagingThread() {
+    public ClientConnectionHandler getManagingThread() {
         return managingThread;
     }
 
-    public void setManagingThread(ClientConnection managingThread) {
+    public void setManagingThread(ClientConnectionHandler managingThread) {
         this.managingThread = managingThread;
     }
 

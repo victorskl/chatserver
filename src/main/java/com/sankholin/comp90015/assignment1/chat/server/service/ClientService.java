@@ -26,7 +26,7 @@ public class ClientService implements Runnable {
             logger.info("Server listening client on port "+ serverSocket.getLocalPort() +" for a connection...");
 
             while (!serverState.isStopRunning()) {
-                pool.execute(new ClientConnectionHandler(serverSocket.accept()));
+                pool.execute(new ClientConnection(serverSocket.accept()));
             }
 
             pool.shutdown();

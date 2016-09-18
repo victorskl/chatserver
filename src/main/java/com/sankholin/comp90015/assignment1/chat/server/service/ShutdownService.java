@@ -1,10 +1,8 @@
 package com.sankholin.comp90015.assignment1.chat.server.service;
 
-import com.sankholin.comp90015.assignment1.chat.server.model.Protocol;
 import com.sankholin.comp90015.assignment1.chat.server.model.ServerInfo;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.json.simple.JSONObject;
 
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -28,7 +26,7 @@ public class ShutdownService extends Thread {
 
         pool.shutdown();
 
-        removeMyMainHallOnPeers();
+        removeMyChatRoomsOnPeers();
 
         try {
             if (!pool.awaitTermination(SHUTDOWN_TIME, TimeUnit.MILLISECONDS)) {
@@ -42,19 +40,17 @@ public class ShutdownService extends Thread {
         }
     }
 
-    private void removeMyMainHallOnPeers() {
-        String roomId = "MainHall-" + serverInfo.getServerId();
+    private void removeMyChatRoomsOnPeers() {
+        JSONMessageBuilder messageBuilder = JSONMessageBuilder.getInstance();
         PeerClient peerClient = new PeerClient();
-
-        //deleteRoomPeers()
-        JSONObject jj = new JSONObject();
-        jj.put(Protocol.type.toString(), Protocol.deleteroom.toString());
-        jj.put(Protocol.serverid.toString(), serverInfo.getServerId());
-        jj.put(Protocol.roomid.toString(), roomId);
 
         for (ServerInfo server : serverState.getServerInfoList()) {
             if (server.equals(serverInfo)) continue;
-            peerClient.commPeer(server, jj.toJSONString());
+
+            // current Protocol has one room deletion per connection
+            for (String roomId : serverState.getLocalChatRooms().keySet()) {
+                peerClient.commPeer(server, messageBuilder.deleteRoomPeers(roomId));
+            }
         }
     }
 

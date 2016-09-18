@@ -93,5 +93,37 @@ public class PeerClient {
                 });
     }
 
+    public String commServerSingleResp(ServerInfo server, String message) {
+
+        Socket socket = null;
+        try {
+            socket = new Socket(server.getAddress(), server.getPort());
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
+            writer.write(message + "\n");
+            writer.flush();
+
+            logger.trace("[A52]Sending  : [" + server.getServerId()
+                    + "@" + server.getAddress() + ":" + server.getPort() + "] " + message);
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+            return reader.readLine();
+
+        } catch (IOException ioe) {
+            //ioe.printStackTrace();
+            logger.trace("[A52]Can't Connect: " + server.getServerId() + "@"
+                    + server.getAddress() + ":" + server.getPort());
+        } finally {
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        return null;
+    }
+
     private static final Logger logger = LogManager.getLogger(PeerClient.class);
 }

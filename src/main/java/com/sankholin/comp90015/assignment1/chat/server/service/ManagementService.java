@@ -26,7 +26,7 @@ public class ManagementService implements Runnable {
             logger.info("Server listening peer on management port "+ serverSocket.getLocalPort() +" for a connection...");
 
             while (!serverState.isStopRunning()) {
-                pool.execute(new ManagementConnectionHandler(serverSocket.accept()));
+                pool.execute(new ManagementConnection(serverSocket.accept()));
             }
 
             pool.shutdown();

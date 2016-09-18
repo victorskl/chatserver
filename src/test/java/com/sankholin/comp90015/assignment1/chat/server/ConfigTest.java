@@ -5,6 +5,7 @@ import com.opencsv.bean.ColumnPositionMappingStrategy;
 import com.opencsv.bean.CsvToBean;
 import com.sankholin.comp90015.assignment1.chat.server.model.ServerInfo;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.File;
@@ -23,7 +24,7 @@ public class ConfigTest {
         reader = new CSVReader(new FileReader(config), '\t');
     }
 
-    @Test
+    @Test @Ignore
     public void testReadConfig() throws IOException {
         String[] record;
         while ((record = reader.readNext()) != null) {
@@ -33,7 +34,7 @@ public class ConfigTest {
         }
     }
 
-    @Test
+    @Test @Ignore
     public void testReadConfigBean() throws FileNotFoundException {
         ColumnPositionMappingStrategy<ServerInfo> strategy = new ColumnPositionMappingStrategy<>();
         strategy.setType(ServerInfo.class);

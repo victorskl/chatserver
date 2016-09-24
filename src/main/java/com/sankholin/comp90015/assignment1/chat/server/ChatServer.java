@@ -77,6 +77,7 @@ public class ChatServer {
 
             startUpConnections();
 
+            //addMainHallsStatically();
             syncChatRooms();
 
             // Shutdown hook
@@ -127,27 +128,31 @@ public class ChatServer {
         }
     }
 
+    private void addMainHallsStatically() {
+        for (ServerInfo server : serverState.getServerInfoList()) {
+            if (server.equals(serverInfo)) continue;
+            String room = "MainHall-" + server.getServerId();
+            RemoteChatRoomInfo remoteRoom = new RemoteChatRoomInfo();
+            remoteRoom.setChatRoomId(room);
+            remoteRoom.setManagingServer(server.getServerId());
+            serverState.getRemoteChatRooms().put(room, remoteRoom);
+        }
+    }
+
     private void syncChatRooms() {
         PeerClient peerClient = new PeerClient();
         JSONMessageBuilder messageBuilder = JSONMessageBuilder.getInstance();
         JSONParser parser = new JSONParser();
 
         for (ServerInfo server : serverState.getServerInfoList()) {
-            if (server.equals(serverInfo)) continue;
+            if (server.equals(this.serverInfo)) continue;
 
             if (serverState.isOnline(server)) {
                 // promote my main hall
-                peerClient.commPeer(server, messageBuilder.lockRoom(mainHall));
-                peerClient.commPeer(server, messageBuilder.releaseRoom(mainHall, "true"));
+                peerClient.commPeer(server, messageBuilder.lockRoom(this.mainHall));
+                peerClient.commPeer(server, messageBuilder.releaseRoom(this.mainHall, "true"));
 
                 // accept theirs
-                String key = "MainHall-" + server.getServerId();
-                if (serverState.isRoomExistedRemotely(key)) continue;
-                RemoteChatRoomInfo remoteChatRoomInfo = new RemoteChatRoomInfo();
-                remoteChatRoomInfo.setChatRoomId(key);
-                remoteChatRoomInfo.setManagingServer(server.getServerId());
-                serverState.getRemoteChatRooms().put(key, remoteChatRoomInfo);
-
                 String resp = peerClient.commServerSingleResp(server, messageBuilder.listRoomsClient());
                 if (resp != null) {
                     try {
@@ -155,10 +160,18 @@ public class ChatServer {
                         JSONArray ja = (JSONArray) jsonMessage.get(Protocol.rooms.toString());
                         for (Object o : ja.toArray()) {
                             String room = (String) o;
-                            if (room.equalsIgnoreCase(key) || room.equalsIgnoreCase(mainHall)) continue;
+                            if (serverState.isRoomExistedRemotely(room)) continue;
                             RemoteChatRoomInfo remoteRoom = new RemoteChatRoomInfo();
                             remoteRoom.setChatRoomId(room);
-                            remoteRoom.setManagingServer(server.getServerId());
+                            String serverId = server.getServerId();
+                            if (room.startsWith("MainHall")) { // every server has MainHall-s* duplicated
+                                String sid = room.split("-")[1];
+                                if (!sid.equalsIgnoreCase(serverId)) {
+                                    //serverId = sid; // Or skip
+                                    continue;
+                                }
+                            }
+                            remoteRoom.setManagingServer(serverId);
                             serverState.getRemoteChatRooms().put(room, remoteRoom);
                         }
                     } catch (ParseException e) {
